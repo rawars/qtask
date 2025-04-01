@@ -1,8 +1,14 @@
 import { join } from 'path';
 import { createPool } from 'generic-pool';
 import { promises as fs } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import Redis from 'ioredis';
 import Logger from './logger.js';
+
+// Obtener la ruta del directorio actual
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 /**
  * Options for RedisManager
@@ -22,7 +28,7 @@ class RedisManager {
   constructor(options = {}) {
     this.logger = options.logger || console;
     this.scripts = options.scripts || ["dequeue", "enqueue", "get_status", "update_status"];
-    this.scriptsDir = join(process.cwd(), 'src/scripts');
+    this.scriptsDir = join(__dirname, 'scripts');
     this.scriptContents = new Map();
     this.scriptShas = new Map();
 
