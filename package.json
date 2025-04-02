@@ -1,6 +1,6 @@
 {
   "name": "@fazpi-ai/qtask",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Simple group queue library.",
   "type": "module",
   "main": "./dist/cjs/index.js",

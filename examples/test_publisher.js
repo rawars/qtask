@@ -1,77 +1,90 @@
-import { RedisManager } from '../src/index.js';
+import { Queue } from '../src/index.js';
 
-// Configuración de Redis
-const redisConfig = {
+// Configuración del publisher
+const publisher = new Queue({
     credentials: {
         host: 'localhost',
         port: 6379,
-        // password: 'tu_contraseña', // Descomenta si necesitas autenticación
-    }
-};
-
-// Crear instancia del RedisManager
-const redisManager = new RedisManager({
-    credentials: redisConfig.credentials,
-    logLevel: 'debug'
+        // password: 'your_password' // opcional
+    },
+    type: 'publisher',
+    logLevel: 'debug' // más información en los logs
 });
 
 // Función principal
 async function main() {
     try {
-        // Inicializar el RedisManager
-        await redisManager.init();
+        // Inicializar el publisher
+        await publisher.init();
+        console.log('Publisher inicializado correctamente');
 
-        // Obtener un cliente Redis
-        const client = await redisManager.getClient();
-
-        // Publicar algunos mensajes de ejemplo
-        const messages = [
-            { id: 1, text: "Mensaje de prueba 1", priority: 1 },
-            { id: 2, text: "Mensaje de prueba 2", priority: 2 },
-            { id: 3, text: "Mensaje de prueba 3", priority: 3 }
-        ];
-
-        // Publicar mensajes en diferentes grupos
-        for (const message of messages) {
-            try {
-                const scriptSha = redisManager.getScriptSha('enqueue');
-                if (!scriptSha) {
-                    console.error('Script de enqueue no encontrado');
-                    continue;
-                }
-
-                const queueKey = 'qtask:WHATSAPP:groups';
-                const groupKey = `qtask:WHATSAPP:group:batch${message.priority}`;
-
-                await client.evalsha(
-                    scriptSha,
-                    2,
-                    queueKey,
-                    groupKey,
-                    JSON.stringify(message),
-                    `batch${message.priority}`,
-                    message.priority,
-                    0, // delay
-                    3600 // TTL: 1 hora
-                );
-
-                console.log(`Mensaje ${message.id} publicado en batch${message.priority}`);
-            } catch (error) {
-                console.error(`Error publicando mensaje ${message.id}:`, error);
+        // Ejemplo 1: Enviar un trabajo simple
+        const jobId1 = await publisher.add(
+            'emails',
+            'notifications',
+            {
+                to: 'usuario@ejemplo.com',
+                subject: 'Bienvenido',
+                body: 'Bienvenido a nuestra plataforma'
             }
+        );
+        console.log(`Trabajo 1 agregado con ID: ${jobId1}`);
+
+        // Ejemplo 2: Enviar múltiples trabajos
+        const jobs = [];
+        for (let i = 0; i < 5; i++) {
+            const jobId = await publisher.add(
+                'emails',
+                'notifications',
+                {
+                    to: `usuario${i}@ejemplo.com`,
+                    subject: `Notificación ${i}`,
+                    body: `Este es el contenido de la notificación ${i}`
+                }
+            );
+            jobs.push(jobId);
+            console.log(`Trabajo ${i + 2} agregado con ID: ${jobId}`);
         }
 
-        // Liberar el cliente Redis
-        await redisManager.releaseClient(client);
+        // Ejemplo 3: Enviar un trabajo a una cola diferente
+        const jobId2 = await publisher.add(
+            'push_notifications',
+            'mobile',
+            {
+                userId: '12345',
+                title: 'Nueva actualización',
+                message: 'Hay una nueva versión disponible'
+            }
+        );
+        console.log(`Trabajo de notificación push agregado con ID: ${jobId2}`);
 
-        // Cerrar el RedisManager
-        await redisManager.close();
-        
-        console.log('Publicación completada');
+        // Cerrar el publisher cuando hayamos terminado
+        await publisher.close();
+        console.log('Publisher cerrado correctamente');
+
     } catch (error) {
-        console.error('Error en el publisher:', error);
+        console.error('Error:', error);
+        // Intentar cerrar el publisher en caso de error
+        try {
+            await publisher.close();
+        } catch (closeError) {
+            console.error('Error al cerrar el publisher:', closeError);
+        }
     }
 }
 
+// Manejar el cierre graceful de la aplicación
+process.on('SIGINT', async () => {
+    console.log('\nCerrando el publisher...');
+    try {
+        await publisher.close();
+        console.log('Publisher cerrado correctamente');
+        process.exit(0);
+    } catch (error) {
+        console.error('Error al cerrar el publisher:', error);
+        process.exit(1);
+    }
+});
+
 // Ejecutar el ejemplo
-main().catch(console.error);
+main();

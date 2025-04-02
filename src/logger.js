@@ -6,16 +6,17 @@ import pino from 'pino';
 class Logger {
   /**
    * Constructor
-   * @param {string} [level='info'] - Log level (silent, debug, info, warn, error)
+   * @param {string|Object} options - Log level (silent, debug, info, warn, error) or options object
    * @param {string} [prefix=''] - Prefix for log messages
    */
-  constructor(level = 'info', prefix = '') {
-    this.level = level;
+  constructor(options = 'info', prefix = '') {
+    // Manejar tanto string como objeto de opciones
+    this.level = typeof options === 'string' ? options : (options.level || 'info');
     this.prefix = prefix;
 
     // Configurar pino con colores y formato bonito
     this.logger = pino({
-      level: level === 'silent' ? 'silent' : level,
+      level: this.level === 'silent' ? 'silent' : this.level,
       transport: {
         target: 'pino-pretty',
         options: {

@@ -1,64 +1,151 @@
 import { v4 as uuidv4 } from 'uuid';
+import Redis from 'ioredis';
 import Logger from './logger.js';
+import Consumer from './consumer.js';
 
 /**
- * Class representing a queue consumer
+ * Class representing a subscriber that manages multiple consumers
  */
 class Subscriber {
-  /**
-   * Constructor
-   * @param {string} sessionId - Session ID
-   * @param {string} queueName - Queue name
-   * @param {Function} callback - Callback function to process jobs
-   * @param {string} [logLevel='info'] - Log level (silent, debug, info, warn, error)
-   */
-  constructor(sessionId, queueName, callback, logLevel = 'info') {
-    this.uid = uuidv4();
-    this.status = 'SLEEPING';
-    this.sessionId = sessionId;
-    this.queueName = queueName;
-    this.callback = callback;
-    this.logger = new Logger(logLevel, `Consumer:${queueName}`);
-  }
-
-  /**
-   * Process a job
-   * @param {Object} job - Job data
-   * @returns {Promise<void>} Promise that resolves when the job has been processed
-   */
-  async process(job) {
-    if (this.status === 'RUNNING') {
-      this.logger.warn(`Consumer for queue ${this.queueName} is already running.`);
-      throw new Error(`Consumer for queue ${this.queueName} is already running.`);
+    constructor(redisManager, options = {}) {
+        this.uid = uuidv4();
+        this.logger = options.logger || new Logger(options.level || 'info');
+        this.redisManager = redisManager;
+        this.consumers = new Map();
+        this.subscriberClient = null;
+        this.activeProcessingInterval = null;
+        this.consumerLimits = options.consumerLimits || {};
     }
-    
-    this.status = 'RUNNING';
-    this.logger.info(`Starting to process job ${job.id} in queue ${this.queueName}`);
 
-    try {
-      await new Promise((resolve, reject) => {
-        this.callback(job, (err) => {
-          if (err) {
-            this.logger.error(`Error processing job ${job.id}: ${err.message}`);
-            reject(err);
-          } else {
-            this.logger.info(`Job ${job.id} processed successfully`);
-            resolve();
-          }
+    async init() {
+        await this.redisManager.init();
+        this.subscriberClient = new Redis(this.redisManager.credentials);
+        await this.setupSubscriber();
+        this.startActiveProcessing();
+        this.logger.info('Subscriber initialized');
+    }
+
+    async setupSubscriber() {
+        if (!this.subscriberClient) return;
+
+        await this.subscriberClient.subscribe('qtask:newjob');
+        this.logger.info('Subscribed to new job notifications');
+
+        this.subscriberClient.on('message', async (channel, message) => {
+            if (channel === 'qtask:newjob') {
+                try {
+                    const jobInfo = JSON.parse(message);
+                    const consumer = this.consumers.get(jobInfo.queueName);
+                    
+                    if (consumer && consumer.status === 'SLEEPING') {
+                        const groupKey = `qtask:${jobInfo.queueName}:group:${jobInfo.groupName}`;
+                        const client = await this.redisManager.getClient();
+                        
+                        try {
+                            const jobCount = await client.zcard(groupKey);
+                            if (jobCount > 0) {
+                                await this.processQueueTasks(jobInfo.queueName);
+                            }
+                        } finally {
+                            await this.redisManager.releaseClient(client);
+                        }
+                    }
+                } catch (error) {
+                    this.logger.error(`Error handling new job message: ${error.message}`);
+                }
+            }
         });
-      });
-    } catch (error) {
-      if (error instanceof Error) {
-        this.logger.error(`Error in consumer for ${this.queueName}: ${error.message}`);
-      } else {
-        this.logger.error(`Unknown error in consumer for ${this.queueName}: ${String(error)}`);
-      }
-      throw error;
-    } finally {
-      this.status = 'SLEEPING';
-      this.logger.debug(`Consumer for ${this.queueName} returns to SLEEPING state`);
     }
-  }
+
+    startActiveProcessing() {
+        if (this.activeProcessingInterval) {
+            clearInterval(this.activeProcessingInterval);
+        }
+        
+        this.activeProcessingInterval = setInterval(async () => {
+            for (const [queueName, consumer] of this.consumers.entries()) {
+                if (consumer.status === 'SLEEPING') {
+                    await this.processQueueTasks(queueName);
+                }
+            }
+        }, 5000);
+    }
+
+    async processQueueTasks(queueName) {
+        const consumer = this.consumers.get(queueName);
+        if (!consumer) return;
+
+        const client = await this.redisManager.getClient();
+        try {
+            const scriptSha = this.redisManager.getScriptSha('dequeue');
+            if (!scriptSha) {
+                this.logger.error('Dequeue script not loaded');
+                return;
+            }
+
+            const queueGroupsKey = `qtask:${queueName}:groups`;
+            const groups = await client.smembers(queueGroupsKey);
+            
+            if (groups.length === 0) return;
+
+            for (const groupKey of groups) {
+                const jobCount = await client.zcard(groupKey);
+                if (jobCount === 0) {
+                    await client.srem(queueGroupsKey, groupKey);
+                    continue;
+                }
+
+                const result = await client.evalsha(scriptSha, 1, groupKey);
+                if (!result || !Array.isArray(result)) continue;
+
+                const [jobId, jobDataStr, groupName] = result;
+                
+                try {
+                    const jobData = JSON.parse(jobDataStr);
+                    await consumer.process({
+                        id: jobId,
+                        data: jobData,
+                        groupName
+                    });
+                } catch (error) {
+                    this.logger.error(`Error processing job ${jobId}: ${error.message}`);
+                }
+            }
+        } catch (error) {
+            this.logger.error(`Error processing queue tasks: ${error.message}`);
+        } finally {
+            await this.redisManager.releaseClient(client);
+        }
+    }
+
+    process(queueName, callback) {
+        if (this.consumers.has(queueName)) {
+            throw new Error(`A processor for queue '${queueName}' already exists`);
+        }
+
+        const consumerLimit = this.consumerLimits[queueName];
+        if (consumerLimit && this.consumers.size >= consumerLimit) {
+            throw new Error(`Consumer limit reached for queue '${queueName}'`);
+        }
+
+        const consumer = new Consumer(uuidv4(), queueName, callback, this.logger.level);
+        this.consumers.set(queueName, consumer);
+        this.logger.info(`New consumer registered for queue '${queueName}'`);
+    }
+
+    async close() {
+        if (this.activeProcessingInterval) {
+            clearInterval(this.activeProcessingInterval);
+            this.activeProcessingInterval = null;
+        }
+
+        if (this.subscriberClient) {
+            this.subscriberClient.disconnect();
+        }
+
+        await this.redisManager.close();
+        this.logger.info('Subscriber closed');
+    }
 }
 
 export default Subscriber; 
