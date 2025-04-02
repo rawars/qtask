@@ -48,6 +48,7 @@ async function main() {
         await subscriber.init();
         console.log('Subscriber inicializado correctamente');
 
+        /*
         // Procesar trabajos de email
         subscriber.process('emails', async (job, done) => {
             console.log(`\n📨 Procesando trabajo de email ${job.id}`);
@@ -60,6 +61,7 @@ async function main() {
                 done(error);
             }
         });
+        */
 
         // Procesar notificaciones push
         subscriber.process('push_notifications', async (job, done) => {

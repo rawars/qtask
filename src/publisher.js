@@ -42,8 +42,12 @@ class Publisher {
                 options.ttl || 0
             );
             
-            await this.publisherClient.publish('qtask:newjob', JSON.stringify({ queueName, groupName }));
+            await this.publisherClient.publish('qtask:newjob', JSON.stringify({ 
+                queueName, 
+                groupName 
+            }));
             
+            this.logger.debug(`Job ${jobId} added to queue ${queueName}, group ${groupName}`);
             return jobId;
         } catch (error) {
             this.logger.error(`Error adding job: ${error.message}`);

@@ -13,7 +13,6 @@ class Subscriber {
         this.redisManager = redisManager;
         this.consumers = new Map();
         this.subscriberClient = null;
-        this.activeProcessingInterval = null;
         this.consumerLimits = options.consumerLimits || {};
     }
 
@@ -21,8 +20,37 @@ class Subscriber {
         await this.redisManager.init();
         this.subscriberClient = new Redis(this.redisManager.credentials);
         await this.setupSubscriber();
-        this.startActiveProcessing();
+        await this.checkPendingJobs();
         this.logger.info('Subscriber initialized');
+    }
+
+    async checkPendingJobs() {
+        const client = await this.redisManager.getClient();
+        try {
+            for (const [queueName, consumer] of this.consumers.entries()) {
+                if (consumer.status !== 'SLEEPING') continue;
+
+                const queueGroupsKey = `qtask:${queueName}:groups`;
+                const groups = await client.smembers(queueGroupsKey);
+
+                this.logger.debug(`Checking pending jobs for queue ${queueName}, found ${groups.length} groups`);
+
+                for (const groupKey of groups) {
+                    // Extraer el nombre del grupo del groupKey (qtask:queueName:group:groupName)
+                    const groupName = groupKey.split(':').pop();
+                    const jobCount = await client.zcard(groupKey);
+                    
+                    if (jobCount > 0) {
+                        this.logger.debug(`Found ${jobCount} pending jobs in group ${groupName}`);
+                        await this.processQueueTasks(queueName, groupName);
+                    }
+                }
+            }
+        } catch (error) {
+            this.logger.error(`Error checking pending jobs: ${error.message}`);
+        } finally {
+            await this.redisManager.releaseClient(client);
+        }
     }
 
     async setupSubscriber() {
@@ -35,21 +63,14 @@ class Subscriber {
             if (channel === 'qtask:newjob') {
                 try {
                     const jobInfo = JSON.parse(message);
-                    const consumer = this.consumers.get(jobInfo.queueName);
-                    
-                    if (consumer && consumer.status === 'SLEEPING') {
-                        const groupKey = `qtask:${jobInfo.queueName}:group:${jobInfo.groupName}`;
-                        const client = await this.redisManager.getClient();
-                        
-                        try {
-                            const jobCount = await client.zcard(groupKey);
-                            if (jobCount > 0) {
-                                await this.processQueueTasks(jobInfo.queueName);
-                            }
-                        } finally {
-                            await this.redisManager.releaseClient(client);
-                        }
-                    }
+                    const queueName = jobInfo.queueName;
+                    // Si recibimos un groupKey completo, extraer el groupName
+                    const groupName = jobInfo.groupName.includes(':') 
+                        ? jobInfo.groupName.split(':').pop() 
+                        : jobInfo.groupName;
+
+                    this.logger.debug(`Received new job notification for queue ${queueName}, group ${groupName}`);
+                    await this.processQueueTasks(queueName, groupName);
                 } catch (error) {
                     this.logger.error(`Error handling new job message: ${error.message}`);
                 }
@@ -57,23 +78,12 @@ class Subscriber {
         });
     }
 
-    startActiveProcessing() {
-        if (this.activeProcessingInterval) {
-            clearInterval(this.activeProcessingInterval);
-        }
-        
-        this.activeProcessingInterval = setInterval(async () => {
-            for (const [queueName, consumer] of this.consumers.entries()) {
-                if (consumer.status === 'SLEEPING') {
-                    await this.processQueueTasks(queueName);
-                }
-            }
-        }, 5000);
-    }
-
-    async processQueueTasks(queueName) {
+    async processQueueTasks(queueName, groupName) {
         const consumer = this.consumers.get(queueName);
-        if (!consumer) return;
+        if (!consumer || consumer.status !== 'SLEEPING') {
+            this.logger.debug(`No available consumer for queue ${queueName} or consumer is busy`);
+            return;
+        }
 
         const client = await this.redisManager.getClient();
         try {
@@ -83,25 +93,30 @@ class Subscriber {
                 return;
             }
 
+            const groupKey = `qtask:${queueName}:group:${groupName}`;
             const queueGroupsKey = `qtask:${queueName}:groups`;
-            const groups = await client.smembers(queueGroupsKey);
             
-            if (groups.length === 0) return;
+            let jobCount = await client.zcard(groupKey);
+            if (jobCount === 0) {
+                await client.srem(queueGroupsKey, groupKey);
+                this.logger.debug(`No jobs found in group ${groupName}`);
+                return;
+            }
 
-            for (const groupKey of groups) {
-                const jobCount = await client.zcard(groupKey);
-                if (jobCount === 0) {
-                    await client.srem(queueGroupsKey, groupKey);
-                    continue;
+            this.logger.debug(`Processing ${jobCount} jobs from group ${groupName} in queue ${queueName}`);
+
+            while (consumer.status === 'SLEEPING' && jobCount > 0) {
+                const result = await client.evalsha(scriptSha, 1, groupKey);
+                if (!result || !Array.isArray(result)) {
+                    this.logger.debug('No more jobs available in group');
+                    break;
                 }
 
-                const result = await client.evalsha(scriptSha, 1, groupKey);
-                if (!result || !Array.isArray(result)) continue;
-
-                const [jobId, jobDataStr, groupName] = result;
+                const [jobId, jobDataStr] = result;
                 
                 try {
                     const jobData = JSON.parse(jobDataStr);
+                    this.logger.debug(`Processing job ${jobId}`);
                     await consumer.process({
                         id: jobId,
                         data: jobData,
@@ -109,6 +124,13 @@ class Subscriber {
                     });
                 } catch (error) {
                     this.logger.error(`Error processing job ${jobId}: ${error.message}`);
+                    break;
+                }
+
+                jobCount = await client.zcard(groupKey);
+                if (jobCount === 0) {
+                    await client.srem(queueGroupsKey, groupKey);
+                    this.logger.debug(`Group ${groupName} is now empty`);
                 }
             }
         } catch (error) {
@@ -131,14 +153,16 @@ class Subscriber {
         const consumer = new Consumer(uuidv4(), queueName, callback, this.logger.level);
         this.consumers.set(queueName, consumer);
         this.logger.info(`New consumer registered for queue '${queueName}'`);
+
+        // Verificar trabajos pendientes para este nuevo consumidor
+        setImmediate(() => {
+            this.checkPendingJobs().catch(error => {
+                this.logger.error(`Error checking pending jobs for new consumer: ${error.message}`);
+            });
+        });
     }
 
     async close() {
-        if (this.activeProcessingInterval) {
-            clearInterval(this.activeProcessingInterval);
-            this.activeProcessingInterval = null;
-        }
-
         if (this.subscriberClient) {
             this.subscriberClient.disconnect();
         }
